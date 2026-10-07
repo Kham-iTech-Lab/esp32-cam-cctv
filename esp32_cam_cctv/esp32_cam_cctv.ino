@@ -7,6 +7,9 @@
  *   - ถ่ายภาพนิ่ง (กดแล้วได้ไฟล์ .jpg)
  *   - เปิด/ปิดไฟแฟลช LED บนบอร์ด
  *   - ปรับความละเอียดภาพ และกลับหัวภาพได้จากหน้าเว็บ
+ *   - บันทึกภาพลง microSD กดเอง หรือถ่ายอัตโนมัติทุก 10 วิ - 30 นาที (timelapse)
+ *     ชื่อไฟล์เป็นวันเวลาจริง การ์ดใกล้เต็มจะลบรูปเก่าสุดให้เอง + หน้าดูรูปย้อนหลัง
+ *     (ใส่การ์ด microSD ไม่เกิน 32GB ฟอร์แมต FAT32 ก่อนเปิดเครื่อง — ไม่ใส่การ์ดก็ใช้งานอื่นได้ปกติ)
  *
  * บอร์ด: AI-Thinker ESP32-CAM (OV2640)
  * Arduino IDE > Tools > Board > "AI Thinker ESP32-CAM"
@@ -22,10 +25,12 @@
 #include <WiFi.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
+#include "sd_storage.h"   // บันทึกลง microSD (ไฟล์อยู่ในโฟลเดอร์เดียวกัน)
 
 // ------------------------------------------------------------------ ตั้งค่า
 const char* WIFI_SSID = "ชื่อ Wi-Fi บ้าน";
 const char* WIFI_PASS = "รหัส Wi-Fi";
+const char* TIME_ZONE = "ICT-7";       // เวลาประเทศไทย ใช้ตั้งชื่อไฟล์รูป
 
 // ขาของบอร์ด AI-Thinker ESP32-CAM
 #define PWDN_GPIO_NUM     32
@@ -51,7 +56,7 @@ httpd_handle_t streamServer = NULL;  // ภาพสด (พอร์ต 81)
 bool flashOn = false;
 
 // ------------------------------------------------------------------ หน้าเว็บ
-static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
+static const char INDEX_TOP[] PROGMEM = R"HTML(<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ESP32-CAM CCTV</title><style>
@@ -74,14 +79,19 @@ button,select{background:#1c2b55;border:2px solid #3cc8ff;color:#fff;border-radi
     <option value="9">SVGA 800x600</option>
     <option value="10">XGA 1024x768</option>
   </select>
-</div>
+</div>)HTML";
+// (ปุ่ม SD จาก sd_storage.h แทรกตรงนี้)
+static const char INDEX_BOTTOM[] PROGMEM = R"HTML(
 <div class="s">ภาพสดจากพอร์ต 81 • ยิ่งความละเอียดสูง ภาพยิ่งกระตุก</div>
 <script>document.getElementById('v').src=location.protocol+'//'+location.hostname+':81/stream';</script>
 </body></html>)HTML";
 
 static esp_err_t indexHandler(httpd_req_t* req) {
   httpd_resp_set_type(req, "text/html; charset=utf-8");
-  return httpd_resp_send(req, INDEX_HTML, strlen(INDEX_HTML));
+  httpd_resp_send_chunk(req, INDEX_TOP, strlen(INDEX_TOP));
+  httpd_resp_send_chunk(req, sdcam::HTML_CONTROLS, strlen(sdcam::HTML_CONTROLS));
+  httpd_resp_send_chunk(req, INDEX_BOTTOM, strlen(INDEX_BOTTOM));
+  return httpd_resp_send_chunk(req, NULL, 0);
 }
 
 // ------------------------------------------------------------------ ถ่ายภาพนิ่ง
@@ -151,6 +161,7 @@ static esp_err_t streamHandler(httpd_req_t* req) {
 void startServers() {
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port = 80;
+  cfg.max_uri_handlers = 16;     // ค่าเริ่มต้นได้แค่ 8 ไม่พอสำหรับเมนู SD
   httpd_uri_t uris[] = {
     {"/",        HTTP_GET, indexHandler,   NULL},
     {"/capture", HTTP_GET, captureHandler, NULL},
@@ -160,6 +171,7 @@ void startServers() {
   };
   if (httpd_start(&webServer, &cfg) == ESP_OK) {
     for (auto& u : uris) httpd_register_uri_handler(webServer, &u);
+    sdcam::registerHandlers(webServer);
   }
 
   cfg.server_port = 81;
@@ -173,6 +185,8 @@ void startServers() {
 // ------------------------------------------------------------------ setup / loop
 void setup() {
   Serial.begin(115200);
+  // เปิดการ์ด SD ก่อนตั้งขาไฟแฟลช (ใช้โหมด 1-bit จึงไม่ชนกับ GPIO 4)
+  Serial.println(sdcam::begin() ? "พบการ์ด SD" : "ไม่พบการ์ด SD — ใช้งานต่อได้ แต่บันทึกภาพไม่ได้");
   pinMode(FLASH_LED_PIN, OUTPUT);
   digitalWrite(FLASH_LED_PIN, LOW);
 
@@ -205,10 +219,12 @@ void setup() {
   Serial.print("กำลังต่อ Wi-Fi");
   while (WiFi.status() != WL_CONNECTED) { delay(400); Serial.print("."); }
 
+  configTzTime(TIME_ZONE, "pool.ntp.org", "time.google.com");   // ดึงเวลาจริงจากอินเทอร์เน็ต
   startServers();
   Serial.printf("\nเปิดในมือถือ: http://%s\n", WiFi.localIP().toString().c_str());
 }
 
 void loop() {
-  delay(10000);   // งานทั้งหมดทำในเซิร์ฟเวอร์ ไม่ต้องทำอะไรใน loop
+  sdcam::loop();   // ถ่ายอัตโนมัติลง SD ตามรอบเวลาที่ตั้งไว้
+  delay(50);
 }
